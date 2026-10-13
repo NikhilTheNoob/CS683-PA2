@@ -65,3 +65,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# problem statement pdf
+PA2-CS683'2026.docx.pdf
+
+# traces
+traces/
+
+# Experimental C-I-RRIP policy; the submission uses I-RRIP
+replacement/cirrip.l2c_repl
