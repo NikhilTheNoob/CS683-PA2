@@ -1,16 +1,268 @@
 #include "cache.h"
 
+// Stride Pattern Prefetcher (SPP), built on the IP-stride prefetcher (ip_stride.l1d_pref).
+// - Uniform strides: same as IP-stride, but gated by a confidence counter.
+// - Non-uniform strides: a per-IP signature (the last 3 strides, 4 bits each) indexes a
+//   shared pattern table that stores the stride that followed that signature.
+// - Accuracy-based throttling scales the prefetch degree.
 
-void CACHE::l1d_prefetcher_initialize() 
+#define IP_TRACKER_COUNT 64     // 24 (as in IP-stride) was too small: Trace3 needs ~64
+#define MASK_IP 0xFF
+
+#define UNIFORM_THRESH 2        // uniform mode when the stride repeated this many times in a row
+#define CONF_MAX 3              // 2-bit saturating counters
+
+#define SIG_BITS 12             // 3 strides x 4 bits
+#define SIG_MASK ((1 << SIG_BITS) - 1)
+#define PT_SIZE (1 << SIG_BITS)
+#define PT_THRESH 1             // minimum pattern table confidence to issue a prefetch
+#define SIG_STRIDE_MIN -8       // strides that fit in 4 bits (two's complement)
+#define SIG_STRIDE_MAX 7
+
+#define EPOCH_PREFETCHES 256    // re-evaluate accuracy after this many prefetches sent to L2
+#define START_DEGREE 4
+#define ACC_HIGH 0.60           // accuracy >= ACC_HIGH -> DEG_HIGH, and so on down
+#define ACC_MID 0.40
+#define ACC_LOW 0.20
+#define DEG_HIGH 6
+#define DEG_MID 4
+#define DEG_LOW 2
+#define DEG_MIN 1
+#define MAX_DEGREE 8            // size of the stats histogram only
+
+class IP_TRACKER {
+  public:
+    // the IP we're tracking
+    uint64_t ip;
+
+    // the last address accessed by this IP
+    uint64_t last_cl_addr;
+
+    // the stride between the last two addresses accessed by this IP
+    int64_t last_stride;
+
+    // use LRU to evict old IP trackers
+    uint32_t lru;
+
+    // how many times in a row the stride repeated (uniform confidence)
+    uint32_t conf;
+
+    // the last 3 strides of this IP, 4 bits each (0 = no history)
+    uint32_t sig;
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+        conf = 0;
+        sig = 0;
+    };
+};
+
+class PT_ENTRY {
+  public:
+    // the stride that followed this signature
+    int64_t next_stride;
+
+    // how reliable that stride has been
+    uint32_t conf;
+
+    PT_ENTRY () {
+        next_stride = 0;
+        conf = 0;
+    };
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+PT_ENTRY pattern_table[PT_SIZE];
+
+// throttling state
+uint32_t degree = START_DEGREE;
+uint64_t epoch_sent = 0, epoch_useful = 0;
+
+// stats for the report
+uint64_t uniform_pf = 0, pattern_pf = 0;
+uint64_t epochs_at_degree[MAX_DEGREE+1] = {0};
+
+static uint32_t update_sig(uint32_t sig, int64_t stride)
+{
+    return ((sig << 4) | (stride & 0xF)) & SIG_MASK;
+}
+
+static bool fits_sig(int64_t stride)
+{
+    return stride >= SIG_STRIDE_MIN && stride <= SIG_STRIDE_MAX;
+}
+
+void CACHE::l1d_prefetcher_initialize()
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+	for (int i=0; i<IP_TRACKER_COUNT; i++)
+        	trackers[i].lru = i;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+	// check for a tracker hit
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    ip = ip & MASK_IP;
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {
+
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+                break;
+        }
+
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].conf = 0;
+        trackers[index].sig = 0;
+
+	for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+
+        return; //metadata_in;
+    }
+
+	// sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return;	//metadata_in;
+
+    // uniform confidence: count repeats, reset when the stride changes
+    if (stride == trackers[index].last_stride) {
+        if (trackers[index].conf < CONF_MAX)
+            trackers[index].conf++;
+    } else
+        trackers[index].conf = 0;
+
+    // train the pattern table: the old signature was followed by this stride
+    uint32_t sig = trackers[index].sig;
+    if (sig != 0 && fits_sig(stride)) {
+        PT_ENTRY &e = pattern_table[sig];
+        if (e.next_stride == stride) {
+            if (e.conf < CONF_MAX)
+                e.conf++;
+        } else if (e.conf > 0)
+            e.conf--;
+        else {
+            e.next_stride = stride;
+            e.conf = 1;
+        }
+    }
+
+    // update the signature with this stride (strides that don't fit reset the history)
+    trackers[index].sig = fits_sig(stride) ? update_sig(sig, stride) : 0;
+
+    if (trackers[index].conf >= UNIFORM_THRESH) {
+
+        // uniform stride: prefetch like IP-stride
+        for (uint32_t i=0; i<degree; i++) {
+            uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+            int ok;
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              ok = prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+              ok = prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            uniform_pf += ok;
+        }
+    } else if (trackers[index].sig != 0) {
+
+        // non-uniform stride: walk the pattern table from the current signature
+        uint32_t walk_sig = trackers[index].sig;
+        uint64_t pf_cl = cl_addr;
+        for (uint32_t i=0; i<degree; i++) {
+            PT_ENTRY &e = pattern_table[walk_sig];
+            if (e.conf < PT_THRESH)
+                break;
+
+            pf_cl += e.next_stride;
+            uint64_t pf_address = pf_cl << LOG2_BLOCK_SIZE;
+
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            int ok;
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              ok = prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+              ok = prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            pattern_pf += ok;
+
+            // pretend the predicted stride happened and predict the next one
+            walk_sig = update_sig(walk_sig, e.next_stride);
+        }
+    }
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = stride;
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+
+    // accuracy-based throttling, using the cache's own prefetch counters:
+    // pf_lower_level = prefetches that missed in L1D and were sent to L2 (same as ChampSim's ACCURACY)
+    if (pf_lower_level < epoch_sent) {
+        // stats were reset at the end of warmup
+        epoch_sent = pf_lower_level;
+        epoch_useful = pf_useful;
+    }
+    if (pf_lower_level - epoch_sent >= EPOCH_PREFETCHES) {
+        double accuracy = (double)(pf_useful - epoch_useful) / (pf_lower_level - epoch_sent);
+        if (accuracy >= ACC_HIGH)
+            degree = DEG_HIGH;
+        else if (accuracy >= ACC_MID)
+            degree = DEG_MID;
+        else if (accuracy >= ACC_LOW)
+            degree = DEG_LOW;
+        else
+            degree = DEG_MIN;
+        epochs_at_degree[degree]++;
+        epoch_sent = pf_lower_level;
+        epoch_useful = pf_useful;
+    }
+    return; //metadata_in;
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -20,5 +272,11 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+	cout << "CPU " << cpu << " L1D SPP final stats" << endl;
+	cout << "SPP uniform prefetches: " << uniform_pf << " pattern prefetches: " << pattern_pf << endl;
+	cout << "SPP epochs at degree";
+	for (int d=1; d<=MAX_DEGREE; d++)
+		cout << " " << d << ":" << epochs_at_degree[d];
+	cout << endl;
+	cout << "SPP final degree: " << degree << endl;
 }
