@@ -34,12 +34,31 @@
 #define PF_CLASS_PATTERN 2
 #define PF_CLASS_META(c) ((uint32_t)(c) << 8)
 
+// keep only the low 16 bits of the last line address; the stride is the sign-extended difference
+// LAST_ADDR_MODE 0 keeps the full address
+#ifndef LAST_ADDR_MODE
+#define LAST_ADDR_MODE 1
+#endif
+#ifndef LAST_ADDR_BITS
+#define LAST_ADDR_BITS 16
+#endif
+#define LA_MASK ((1ull << LAST_ADDR_BITS) - 1)
+
+static uint64_t encode_last(uint64_t cl_addr)
+{
+#if LAST_ADDR_MODE == 1
+    return cl_addr & LA_MASK;
+#else
+    return cl_addr;
+#endif
+}
+
 class IP_TRACKER {
   public:
     // the IP we're tracking
     uint64_t ip;
 
-    // the last address accessed by this IP
+    // the last address accessed by this IP (low 16 bits only)
     uint64_t last_cl_addr;
 
     // the stride between the last two addresses accessed by this IP
@@ -133,7 +152,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
 
         trackers[index].ip = ip;
-        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_cl_addr = encode_last(cl_addr);
         trackers[index].last_stride = 0;
         trackers[index].conf = 0;
         trackers[index].sig = 0;
@@ -156,12 +175,19 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     // this bit appears overly complicated because we're calculating
     // differences between unsigned address variables
     int64_t stride = 0;
+#if LAST_ADDR_MODE == 1
+    {
+        uint64_t d = (encode_last(cl_addr) - trackers[index].last_cl_addr) & LA_MASK;
+        stride = (d & (1ull << (LAST_ADDR_BITS - 1))) ? (int64_t)d - (int64_t)(1ull << LAST_ADDR_BITS) : (int64_t)d;
+    }
+#else
     if (cl_addr > trackers[index].last_cl_addr)
         stride = cl_addr - trackers[index].last_cl_addr;
     else {
         stride = trackers[index].last_cl_addr - cl_addr;
         stride *= -1;
     }
+#endif
 
     // don't do anything if we somehow saw the same address twice in a row
     if (stride == 0)
@@ -239,7 +265,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
 
-    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_cl_addr = encode_last(cl_addr);
     trackers[index].last_stride = stride;
 
     for (int i=0; i<IP_TRACKER_COUNT; i++) {
