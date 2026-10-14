@@ -74,3 +74,4 @@ traces/
 
 # Experimental C-I-RRIP policy; the submission uses I-RRIP
 replacement/cirrip.l2c_repl
+bin/
