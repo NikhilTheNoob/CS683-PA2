@@ -29,6 +29,11 @@
 #define DEG_LOW 2
 #define DEG_MIN 1
 
+// mode that issued a prefetch, stored in bits 11:8 of the metadata (ChampSim counts filled/useful per class)
+#define PF_CLASS_UNIFORM 1
+#define PF_CLASS_PATTERN 2
+#define PF_CLASS_META(c) ((uint32_t)(c) << 8)
+
 class IP_TRACKER {
   public:
     // the IP we're tracking
@@ -83,6 +88,9 @@ uint64_t epoch_sent = 0, epoch_useful = 0;
 // stats for the report
 uint64_t uniform_pf = 0, pattern_pf = 0;
 uint64_t epochs_at_degree[DEG_HIGH+1] = {0};
+
+// per-mode counters at the end of warmup (ChampSim does not reset them)
+uint64_t roi_filled_base[3] = {0}, roi_useful_base[3] = {0};
 
 static uint32_t update_sig(uint32_t sig, int64_t stride)
 {
@@ -198,9 +206,9 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
             int ok;
             if (MSHR.occupancy < (MSHR.SIZE>>1))
-              ok = prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+              ok = prefetch_line(ip, addr, pf_address, FILL_L1, PF_CLASS_META(PF_CLASS_UNIFORM));
             else
-              ok = prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+              ok = prefetch_line(ip, addr, pf_address, FILL_L2, PF_CLASS_META(PF_CLASS_UNIFORM));
             uniform_pf += ok;
         }
     } else if (trackers[index].sig != 0) {
@@ -221,9 +229,9 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
             int ok;
             if (MSHR.occupancy < (MSHR.SIZE>>1))
-              ok = prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+              ok = prefetch_line(ip, addr, pf_address, FILL_L1, PF_CLASS_META(PF_CLASS_PATTERN));
             else
-              ok = prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+              ok = prefetch_line(ip, addr, pf_address, FILL_L2, PF_CLASS_META(PF_CLASS_PATTERN));
             pattern_pf += ok;
 
             // pretend the predicted stride happened and predict the next one
@@ -246,6 +254,10 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         // stats were reset at the end of warmup
         epoch_sent = pf_lower_level;
         epoch_useful = pf_useful;
+        for (int c=1; c<=2; c++) {
+            roi_filled_base[c] = pref_filled[cpu][c];
+            roi_useful_base[c] = pref_useful[cpu][c];
+        }
     }
     if (pf_lower_level - epoch_sent >= EPOCH_PREFETCHES) {
         double accuracy = (double)(pf_useful - epoch_useful) / (pf_lower_level - epoch_sent);
@@ -278,4 +290,11 @@ void CACHE::l1d_prefetcher_final_stats()
 		cout << " " << d << ":" << epochs_at_degree[d];
 	cout << endl;
 	cout << "SPP final degree: " << degree << endl;
+	const char *name[3] = {"", "uniform", "pattern"};
+	for (int c=1; c<=2; c++) {
+		uint64_t filled = pref_filled[cpu][c] - roi_filled_base[c];
+		uint64_t useful = pref_useful[cpu][c] - roi_useful_base[c];
+		cout << "SPP " << name[c] << " prefetches filled into L1D: " << filled << " useful: " << useful
+		     << " accuracy: " << (filled ? 100.0 * useful / filled : 0.0) << endl;
+	}
 }
