@@ -210,6 +210,17 @@ cp replacement/${STLB_REPLACEMENT}.stlb_repl replacement/stlb_replacement.cc
 
 
 
+# Pick the compiler: $CXX if set, else g++-7 if installed, else the default g++.
+# ChampSim needs GCC 7; newer GCC builds crash at -O3 (UB in page_table_walker.cc).
+if [ -z "$CXX" ]; then
+    if command -v g++-7 > /dev/null 2>&1; then
+        CXX=g++-7
+    else
+        CXX=g++
+    fi
+fi
+echo "Compiler: $CXX ($($CXX -dumpversion))"
+
 # Build
 mkdir -p bin
 rm -f bin/champsim
@@ -217,7 +228,7 @@ make clean
 if [ "$#" -eq 19 ]; then
     make CC=${19} CCX=${19}
 else
-    make
+    make CXX=$CXX
 fi
 
 # Sanity check
