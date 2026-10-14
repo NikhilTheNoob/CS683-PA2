@@ -4,7 +4,7 @@
 // - Uniform strides: same as IP-stride, but has a confidence counter.
 // - Non-uniform strides: a per-IP signature (the last 3 strides, 4 bits each) indexes a
 //   shared pattern table that stores the stride that followed that signature.
-// - Accuracy-based throttling scales the prefetch degree.
+// - Accuracy-based throttling, with a separate degree for uniform and pattern mode.
 
 #define IP_TRACKER_COUNT 64     // 24 (as in IP-stride) was too small: Trace3 needs ~64
 #define MASK_IP 0xFF
@@ -19,15 +19,18 @@
 #define SIG_STRIDE_MIN -8       // strides that fit in 4 bits (two's complement)
 #define SIG_STRIDE_MAX 7
 
-#define EPOCH_PREFETCHES 256    // re-evaluate accuracy after this many prefetches sent to L2
-#define START_DEGREE 4
-#define ACC_HIGH 0.60           // accuracy >= ACC_HIGH -> DEG_HIGH, and so on down
-#define ACC_MID 0.40
-#define ACC_LOW 0.20
-#define DEG_HIGH 6
-#define DEG_MID 4
-#define DEG_LOW 2
-#define DEG_MIN 1
+// throttling: each mode has its own degree, set by its own accuracy (useful / filled into L1D)
+// every EPOCH_FILLS fills the degree moves one level: up if accuracy >= ACC_UP, down if < ACC_DOWN
+// moving one level at a time stops the degree from jumping back and forth every epoch
+#define EPOCH_FILLS 64          // re-evaluate a mode after this many of its prefetches fill L1D
+#define ACC_UP   0.60
+#define ACC_DOWN 0.40
+#define DEG_HIGH 8
+#define DEG_MID  4
+#define DEG_LOW  2
+#define DEG_MIN  1
+#define NUM_LEVELS 4
+#define START_LEVEL 2           // start at DEG_MID
 
 // mode that issued a prefetch, stored in bits 11:8 of the metadata (ChampSim counts filled/useful per class)
 #define PF_CLASS_UNIFORM 1
@@ -100,15 +103,19 @@ class PT_ENTRY {
 IP_TRACKER trackers[IP_TRACKER_COUNT];
 PT_ENTRY pattern_table[PT_SIZE];
 
-// throttling state
-uint32_t degree = START_DEGREE;
-uint64_t epoch_sent = 0, epoch_useful = 0;
+// throttling state per mode (1 = uniform, 2 = pattern)
+static const uint32_t LEVELS[NUM_LEVELS] = {DEG_MIN, DEG_LOW, DEG_MID, DEG_HIGH};
+uint32_t mode_level[3]  = {0, START_LEVEL, START_LEVEL};
+uint32_t mode_degree[3] = {0, DEG_MID, DEG_MID};
+uint64_t mode_ep_filled[3] = {0}, mode_ep_useful[3] = {0};   // counters at the start of the epoch
 
 // stats for the report
 uint64_t uniform_pf = 0, pattern_pf = 0;
-uint64_t epochs_at_degree[DEG_HIGH+1] = {0};
+uint64_t mode_epochs[3] = {0}, mode_changes[3] = {0};
+uint64_t mode_epochs_at_degree[3][DEG_HIGH+1] = {{0}};
 
 // per-mode counters at the end of warmup (ChampSim does not reset them)
+bool roi_snapshot_taken = false;
 uint64_t roi_filled_base[3] = {0}, roi_useful_base[3] = {0};
 
 static uint32_t update_sig(uint32_t sig, int64_t stride)
@@ -221,7 +228,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     if (trackers[index].conf >= UNIFORM_THRESH) {
 
         // uniform stride: prefetch like IP-stride
-        for (uint32_t i=0; i<degree; i++) {
+        for (uint32_t i=0; i<mode_degree[PF_CLASS_UNIFORM]; i++) {
             uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
 
             // only issue a prefetch if the prefetch address is in the same 4 KB page
@@ -242,7 +249,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         // non-uniform stride: walk the pattern table from the current signature
         uint32_t walk_sig = trackers[index].sig;
         uint64_t pf_cl = cl_addr;
-        for (uint32_t i=0; i<degree; i++) {
+        for (uint32_t i=0; i<mode_degree[PF_CLASS_PATTERN]; i++) {
             PT_ENTRY &e = pattern_table[walk_sig];
             if (e.conf < PT_THRESH)
                 break;
@@ -274,30 +281,36 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     }
     trackers[index].lru = 0;
 
-    // accuracy-based throttling, using the cache's own prefetch counters:
-    // pf_lower_level = prefetches that missed in L1D and were sent to L2 (same as ChampSim's ACCURACY)
-    if (pf_lower_level < epoch_sent) {
-        // stats were reset at the end of warmup
-        epoch_sent = pf_lower_level;
-        epoch_useful = pf_useful;
-        for (int c=1; c<=2; c++) {
+    if (!roi_snapshot_taken && warmup_complete[cpu]) {
+        for (int c=PF_CLASS_UNIFORM; c<=PF_CLASS_PATTERN; c++) {
             roi_filled_base[c] = pref_filled[cpu][c];
             roi_useful_base[c] = pref_useful[cpu][c];
         }
+        roi_snapshot_taken = true;
     }
-    if (pf_lower_level - epoch_sent >= EPOCH_PREFETCHES) {
-        double accuracy = (double)(pf_useful - epoch_useful) / (pf_lower_level - epoch_sent);
-        if (accuracy >= ACC_HIGH)
-            degree = DEG_HIGH;
-        else if (accuracy >= ACC_MID)
-            degree = DEG_MID;
-        else if (accuracy >= ACC_LOW)
-            degree = DEG_LOW;
-        else
-            degree = DEG_MIN;
-        epochs_at_degree[degree]++;
-        epoch_sent = pf_lower_level;
-        epoch_useful = pf_useful;
+
+    // accuracy-based throttling, per mode
+    for (int c=PF_CLASS_UNIFORM; c<=PF_CLASS_PATTERN; c++) {
+        uint64_t filled = pref_filled[cpu][c] - mode_ep_filled[c];
+        if (filled < EPOCH_FILLS)
+            continue;
+        double accuracy = (double)(pref_useful[cpu][c] - mode_ep_useful[c]) / filled;
+
+        if (accuracy >= ACC_UP && mode_level[c] < NUM_LEVELS-1)
+            mode_level[c]++;
+        else if (accuracy < ACC_DOWN && mode_level[c] > 0)
+            mode_level[c]--;
+        uint32_t new_degree = LEVELS[mode_level[c]];
+
+        if (warmup_complete[cpu]) {
+            mode_epochs[c]++;
+            if (new_degree != mode_degree[c])
+                mode_changes[c]++;
+            mode_epochs_at_degree[c][new_degree]++;
+        }
+        mode_degree[c] = new_degree;
+        mode_ep_filled[c] = pref_filled[cpu][c];
+        mode_ep_useful[c] = pref_useful[cpu][c];
     }
     return; //metadata_in;
 }
@@ -311,12 +324,15 @@ void CACHE::l1d_prefetcher_final_stats()
 {
 	cout << "CPU " << cpu << " L1D SPP final stats" << endl;
 	cout << "SPP uniform prefetches: " << uniform_pf << " pattern prefetches: " << pattern_pf << endl;
-	cout << "SPP epochs at degree";
-	for (int d=1; d<=DEG_HIGH; d++)
-		cout << " " << d << ":" << epochs_at_degree[d];
-	cout << endl;
-	cout << "SPP final degree: " << degree << endl;
 	const char *name[3] = {"", "uniform", "pattern"};
+	for (int c=1; c<=2; c++) {
+		cout << "SPP " << name[c] << " epochs: " << mode_epochs[c] << " degree changes: " << mode_changes[c]
+		     << " epochs at degree";
+		for (int d=1; d<=DEG_HIGH; d++)
+			if (d == DEG_MIN || d == DEG_LOW || d == DEG_MID || d == DEG_HIGH)
+				cout << " " << d << ":" << mode_epochs_at_degree[c][d];
+		cout << " final degree: " << mode_degree[c] << endl;
+	}
 	for (int c=1; c<=2; c++) {
 		uint64_t filled = pref_filled[cpu][c] - roi_filled_base[c];
 		uint64_t useful = pref_useful[cpu][c] - roi_useful_base[c];
